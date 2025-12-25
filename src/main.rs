@@ -2,13 +2,32 @@
 
 mod task;
 
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+#[derive(Parser)]
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Download with a config file
+    Download {
+        /// Path to config file
+        config_path: PathBuf,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,7 +45,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     info!("tracing initialized");
 
-    let config: task::Config = toml::from_str(include_str!("../config.toml"))?;
+    let cli = Cli::parse();
+
+    let raw_config = match cli.command {
+        Command::Download { config_path } => {
+            info!("reading {}", config_path.display());
+            fs::read_to_string(config_path)?
+        }
+    };
+    let config: task::Config = toml::from_str(&raw_config)?;
 
     for task_config in config.tasks.iter() {
         let task = Arc::new(
