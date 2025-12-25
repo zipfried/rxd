@@ -35,3 +35,4 @@ jobs:
           tar: unix
           zip: windows
           token: ${{ secrets.GITHUB_TOKEN }}
+          include: README.md,example.toml
