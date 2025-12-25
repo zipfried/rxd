@@ -31,6 +31,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
     let indicatif_layer = IndicatifLayer::new();
     tracing_subscriber::registry()
         .with(
@@ -44,8 +46,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(LevelFilter::INFO)
         .init();
     info!("tracing initialized");
-
-    let cli = Cli::parse();
 
     let raw_config = match cli.command {
         Command::Download { config_path } => {
