@@ -8,3 +8,4 @@ concurrent_downloads = 8
 
 [[tasks]]
 screen_name = ""
+save_path = "path/to/files"

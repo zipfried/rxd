@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &config.auth_token,
                 &config.ct0,
                 config.concurrent_downloads,
+                task_config.save_path.as_deref(),
             )
             .await?,
         );

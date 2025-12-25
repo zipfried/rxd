@@ -32,6 +32,8 @@ fn default_concurrent_downloads() -> usize {
 #[derive(Debug, Deserialize)]
 pub struct TaskConfig {
     pub screen_name: String,
+    #[serde(default)]
+    pub save_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,11 +71,16 @@ impl Task {
         auth_token: &str,
         ct0: &str,
         concurrent_downloads: usize,
+        save_path: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let client = build_client(screen_name, auth_token, ct0)?;
         let user = fetch_user_info(&client, screen_name).await?;
 
-        let save_path = PathBuf::from("downloads").join(&user.screen_name);
+        let save_path = if let Some(custom_path) = save_path {
+            PathBuf::from(custom_path)
+        } else {
+            PathBuf::from("downloads").join(&user.screen_name)
+        };
         fs::create_dir_all(&save_path).await?;
 
         info!(
