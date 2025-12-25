@@ -1,4 +1,4 @@
-# rxd - Rust X Downloader
+# rxd - Rust X/Twitter Downloader
 
 ## Usage
 
