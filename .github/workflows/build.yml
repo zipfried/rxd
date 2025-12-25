@@ -29,6 +29,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           RUSTTARGET: ${{ matrix.target }}
+          TOOLCHAIN_VERSION: stable
           EXTRA_FILES: "README.md"
           ARCHIVE_TYPES: ${{ matrix.archive }}
   release_without_not_required:
@@ -44,6 +45,7 @@ jobs:
         uses: rust-build/rust-build.action@master
         with:
           RUSTTARGET: ${{ matrix.target }}
+          TOOLCHAIN_VERSION: stable
           UPLOAD_MODE: none
       - name: Checkout output
         run: ls -laR
