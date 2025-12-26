@@ -360,8 +360,7 @@ async fn fetch_user_info(
         return Err(format!("API error: {}", status).into());
     }
 
-    let body = response.text().await?;
-    let raw: Value = serde_json::from_str(&body)?;
+    let raw: Value = response.json().await?;
 
     let result = raw
         .pointer("/data/user/result")
