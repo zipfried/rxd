@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use chrono::{Local, TimeZone};
-use futures::stream::{self, StreamExt};
+use chrono::{DateTime, FixedOffset, Local};
+use futures::stream;
+use futures::stream::StreamExt;
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, COOKIE, REFERER, USER_AGENT};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -48,7 +49,7 @@ struct User {
 struct MediaItem {
     url: String,
     media_type: MediaType,
-    tweet_timestamp_ms: i64,
+    timestamp: DateTime<FixedOffset>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,21 +121,14 @@ impl Task {
 
             info!("found {} media items on page {}", media_items.len(), page);
 
-            let download_tasks: Vec<_> = media_items
-                .iter()
-                .map(|item| {
-                    let datetime = Local.timestamp_millis_opt(item.tweet_timestamp_ms).unwrap();
-                    let date_str = datetime.format("%Y-%m-%d").to_string();
-                    (item.clone(), date_str)
-                })
-                .collect();
-
             let self_clone = Arc::clone(&self);
-            let results: Vec<_> = stream::iter(download_tasks)
-                .map(|(item, date_str)| {
+            let results: Vec<_> = stream::iter(media_items.iter())
+                .map(|item| {
                     let task = Arc::clone(&self_clone);
+                    let local_dt = item.timestamp.with_timezone(&Local);
+                    let date_str = local_dt.format("%Y-%m-%d").to_string();
                     async move {
-                        match task.download_media(&item, &date_str).await {
+                        match task.download_media(item, &date_str).await {
                             Ok(path) => {
                                 info!("downloaded: {}", path.display());
                                 Ok(())
@@ -447,19 +441,21 @@ fn parse_user_media_response(
 fn extract_media_from_item(item: &Value) -> Option<Vec<MediaItem>> {
     let mut results = Vec::new();
 
-    let tweet_results = item.pointer("/item/itemContent/tweet_results/result")?;
+    let result = item.pointer("/item/itemContent/tweet_results/result")?;
 
-    let tweet_timestamp_ms = tweet_results
-        .pointer("/edit_control/editable_until_msecs")
-        .or_else(|| tweet_results.pointer("/tweet/edit_control/editable_until_msecs"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<i64>().ok())
-        .map(|ms| ms - 3600000)
-        .unwrap_or(0);
-
-    let legacy = tweet_results
+    let legacy = result
         .get("legacy")
-        .or_else(|| tweet_results.pointer("/tweet/legacy"))?;
+        .or_else(|| result.pointer("/tweet/legacy"))?;
+
+    let timestamp = legacy
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            // Wed Mar 12 18:47:51 +0000 2025
+            //  %a  %b %d %H:%M:%S    %z   %Y
+            DateTime::parse_from_str(s, "%a %b %d %H:%M:%S %z %Y").ok()
+        })
+        .unwrap_or(DateTime::<FixedOffset>::default());
 
     let media_array = legacy
         .pointer("/extended_entities/media")
@@ -477,7 +473,7 @@ fn extract_media_from_item(item: &Value) -> Option<Vec<MediaItem>> {
                     results.push(MediaItem {
                         url: url.to_string(),
                         media_type: MediaType::Image,
-                        tweet_timestamp_ms,
+                        timestamp,
                     });
                 }
             }
@@ -502,7 +498,7 @@ fn extract_media_from_item(item: &Value) -> Option<Vec<MediaItem>> {
                         results.push(MediaItem {
                             url: url.to_string(),
                             media_type: MediaType::Video,
-                            tweet_timestamp_ms,
+                            timestamp,
                         });
                     }
                 }
