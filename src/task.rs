@@ -3,7 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset, Local};
-use futures::stream;
+use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, COOKIE, REFERER, USER_AGENT};
@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 use tracing::{error, info, instrument, trace, warn};
 
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36";
@@ -73,7 +74,7 @@ impl Task {
         ct0: &str,
         concurrent_downloads: usize,
         save_path: Option<&str>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let client = build_client(screen_name, auth_token, ct0)?;
         let user = fetch_user_info(&client, screen_name).await?;
 
@@ -98,67 +99,113 @@ impl Task {
     }
 
     #[instrument(skip_all)]
-    pub async fn execute(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
-        info!(
-            "starting download with {} concurrent downloads",
-            self.concurrent_downloads
-        );
+    pub async fn execute(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        info!("starting parallel fetch and download");
 
-        let mut cursor: Option<String> = None;
-        let mut total_downloaded = 0u64;
-        let mut page = 0u32;
+        // Create a channel for media items
+        let (tx, mut rx) = mpsc::channel::<MediaItem>(1000);
 
-        loop {
-            page += 1;
-            info!("fetching page {}", page);
-
-            let (media_items, next_cursor) = self.fetch_user_media(cursor.as_deref()).await?;
-
-            if media_items.is_empty() {
-                info!("no more media items found");
-                break;
-            }
-
-            info!("found {} media items on page {}", media_items.len(), page);
-
+        // Spawn a task to fetch media items
+        let fetch_task = {
             let self_clone = Arc::clone(&self);
-            let results: Vec<_> = stream::iter(media_items.iter())
-                .map(|item| {
-                    let task = Arc::clone(&self_clone);
-                    let local_dt = item.timestamp.with_timezone(&Local);
-                    let date_str = local_dt.format("%Y-%m-%d").to_string();
-                    async move {
-                        match task.download_media(item, &date_str).await {
-                            Ok(path) => {
-                                info!("downloaded: {}", path.display());
-                                Ok(())
+            tokio::spawn(async move {
+                let mut cursor: Option<String> = None;
+                let mut page = 0u32;
+                let mut total_items = 0usize;
+
+                loop {
+                    page += 1;
+                    info!("fetching page {}", page);
+
+                    match self_clone.fetch_user_media(cursor.as_deref()).await {
+                        Ok((media_items, next_cursor)) => {
+                            if media_items.is_empty() {
+                                info!("no more media items found");
+                                break;
                             }
-                            Err(e) => {
-                                warn!("failed to download {}: {}", item.url, e);
-                                Err(e)
+
+                            info!("found {} media items on page {}", media_items.len(), page);
+                            total_items += media_items.len();
+
+                            // Send media items to the channel
+                            for item in media_items {
+                                if tx.send(item).await.is_err() {
+                                    warn!("receiver dropped, stopping fetch");
+                                    return total_items;
+                                }
+                            }
+
+                            match next_cursor {
+                                Some(c) => cursor = Some(c),
+                                None => {
+                                    info!("no more pages");
+                                    break;
+                                }
                             }
                         }
+                        Err(e) => {
+                            error!("failed to fetch media: {}", e);
+                            break;
+                        }
                     }
-                })
-                .buffer_unordered(self.concurrent_downloads)
-                .collect()
-                .await;
-
-            let successful = results.iter().filter(|r| r.is_ok()).count();
-            total_downloaded += successful as u64;
-
-            match next_cursor {
-                Some(c) => cursor = Some(c),
-                None => {
-                    info!("No more pages");
-                    break;
                 }
+
+                info!("fetch complete: {} total media items", total_items);
+                total_items
+            })
+        };
+
+        // Download media items as they arrive using FuturesUnordered for true concurrency
+        let mut total_downloaded: usize = 0;
+        let mut downloads = FuturesUnordered::new();
+        let mut receiving = true;
+
+        loop {
+            tokio::select! {
+                // Receive new media items from the channel
+                item = rx.recv(), if receiving && downloads.len() < self.concurrent_downloads => {
+                    match item {
+                        Some(item) => {
+                            let self_clone = Arc::clone(&self);
+                            let local_dt = item.timestamp.with_timezone(&Local);
+                            let date_str = local_dt.format("%Y-%m-%d").to_string();
+
+                            downloads.push(async move {
+                                match self_clone.download_media(&item, &date_str).await {
+                                    Ok(path) => {
+                                        info!("downloaded: {}", path.display());
+                                        Ok(())
+                                    }
+                                    Err(e) => {
+                                        warn!("failed to download {}: {}", item.url, e);
+                                        Err(e)
+                                    }
+                                }
+                            });
+                        }
+                        None => {
+                            // Channel closed, no more items to receive
+                            receiving = false;
+                        }
+                    }
+                }
+                // Process completed downloads
+                result = downloads.next(), if !downloads.is_empty() => {
+                    if let Some(Ok(_)) = result {
+                        total_downloaded += 1;
+                    }
+                }
+                // Exit when channel is closed and all downloads are complete
+                else => break,
             }
         }
 
+        // Wait for fetch task to complete
+        let total_fetched = fetch_task.await.unwrap_or(0);
+
         info!(
-            "download complete for @{}: {} items downloaded",
-            self.user.screen_name, total_downloaded
+            "download complete for @{}: {} items downloaded out of {} fetched",
+            self.user.screen_name, total_downloaded, total_fetched
         );
         Ok(())
     }
@@ -167,7 +214,7 @@ impl Task {
     async fn fetch_user_media(
         &self,
         cursor: Option<&str>,
-    ) -> Result<(Vec<MediaItem>, Option<String>), Box<dyn std::error::Error>> {
+    ) -> Result<(Vec<MediaItem>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
         let variables = if let Some(c) = cursor {
             json!({
                 "userId": self.user.rest_id,
@@ -245,7 +292,7 @@ impl Task {
         &self,
         item: &MediaItem,
         date_str: &str,
-    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
         let download_url = match item.media_type {
             MediaType::Image => format!("{}?name=orig", item.url),
             MediaType::Video => item.url.clone(),
@@ -291,7 +338,7 @@ fn build_client(
     screen_name: &str,
     auth_token: &str,
     ct0: &str,
-) -> Result<Client, Box<dyn std::error::Error>> {
+) -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
     headers.insert(
@@ -319,7 +366,7 @@ fn build_client(
 async fn fetch_user_info(
     client: &Client,
     screen_name: &str,
-) -> Result<User, Box<dyn std::error::Error>> {
+) -> Result<User, Box<dyn std::error::Error + Send + Sync>> {
     let variables = json!({
         "screen_name": screen_name,
         "withSafetyModeUserFields": false,
@@ -393,7 +440,7 @@ async fn fetch_user_info(
 #[instrument(skip_all)]
 fn parse_user_media_response(
     raw: &Value,
-) -> Result<(Vec<MediaItem>, Option<String>), Box<dyn std::error::Error>> {
+) -> Result<(Vec<MediaItem>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
     let mut media_items = Vec::new();
     let mut next_cursor: Option<String> = None;
 
