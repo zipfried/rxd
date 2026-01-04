@@ -1,5 +1,6 @@
 #![warn(clippy::unwrap_used)]
 
+mod db;
 mod task;
 
 use std::fs;
@@ -47,13 +48,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
     info!("tracing initialized");
 
-    let raw_config = match cli.command {
+    let (raw_config, config_dir) = match &cli.command {
         Command::Download { config_path } => {
             info!("reading {}", config_path.display());
-            fs::read_to_string(config_path)?
+            let content = fs::read_to_string(config_path)?;
+            let dir = config_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            (content, dir)
         }
     };
     let config: task::Config = toml::from_str(&raw_config)?;
+
+    // Initialize database in the same directory as config file
+    let db_path = config_dir.join("rxd.db");
+    let db = db::init_db(&db_path).await?;
 
     for task_config in config.tasks.iter() {
         let task = Arc::new(
@@ -63,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 &config.ct0,
                 config.concurrent_downloads,
                 task_config.save_path.as_deref(),
+                db.clone(),
             )
             .await?,
         );

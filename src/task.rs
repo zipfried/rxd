@@ -9,11 +9,14 @@ use reqwest::header::{AUTHORIZATION, COOKIE, REFERER, USER_AGENT};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sqlx::SqlitePool;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::instrument;
 use tracing::{error, info, trace, warn};
+
+use crate::db;
 
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36";
 const DEFAULT_AUTHORIZATION: &str = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
@@ -48,9 +51,11 @@ struct User {
 
 #[derive(Debug, Clone)]
 struct MediaItem {
+    tweet_id: String,
     url: String,
     media_type: MediaType,
     timestamp: DateTime<FixedOffset>,
+    full_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,11 +64,18 @@ enum MediaType {
     Video,
 }
 
+/// Result of a download operation
+enum DownloadResult {
+    Downloaded,
+    Skipped,
+}
+
 pub struct Task {
     client: Client,
     user: User,
     save_path: PathBuf,
     concurrent_downloads: usize,
+    db: SqlitePool,
 }
 
 impl Task {
@@ -74,6 +86,7 @@ impl Task {
         ct0: &str,
         concurrent_downloads: usize,
         save_path: Option<&str>,
+        db: SqlitePool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let client = build_client(screen_name, auth_token, ct0)?;
         let user = fetch_user_info(&client, screen_name).await?;
@@ -95,6 +108,7 @@ impl Task {
             user,
             save_path,
             concurrent_downloads,
+            db,
         })
     }
 
@@ -105,7 +119,7 @@ impl Task {
         // Create a channel for media items
         let (tx, mut rx) = mpsc::channel::<MediaItem>(1000);
 
-        // Spawn a task to fetch media items
+        // Spawn a task to fetch media items and save to database
         let fetch_task = {
             let self_clone = Arc::clone(&self);
             tokio::spawn(async move {
@@ -127,8 +141,36 @@ impl Task {
                             info!("found {} media items on page {}", media_items.len(), page);
                             total_items += media_items.len();
 
-                            // Send media items to the channel
+                            // Save to database and send media items to the channel
                             for item in media_items {
+                                let local_dt = item.timestamp.with_timezone(&Local);
+                                let tweet_time = local_dt.format("%Y-%m-%d %H:%M:%S").to_string();
+
+                                // Upsert tweet record
+                                if let Err(e) = db::upsert_tweet(
+                                    &self_clone.db,
+                                    &item.tweet_id,
+                                    &self_clone.user.screen_name,
+                                    &tweet_time,
+                                    item.full_text.as_deref(),
+                                )
+                                .await
+                                {
+                                    warn!("failed to save tweet {}: {}", item.tweet_id, e);
+                                }
+
+                                // Upsert media record (filename will be updated after download)
+                                if let Err(e) = db::upsert_media(
+                                    &self_clone.db,
+                                    &item.tweet_id,
+                                    &item.url,
+                                    None,
+                                )
+                                .await
+                                {
+                                    warn!("failed to save media {}: {}", item.url, e);
+                                }
+
                                 if tx.send(item).await.is_err() {
                                     warn!("receiver dropped, stopping fetch");
                                     return total_items;
@@ -157,6 +199,7 @@ impl Task {
 
         // Download media items as they arrive using FuturesUnordered for true concurrency
         let mut total_downloaded: usize = 0;
+        let mut total_skipped: usize = 0;
         let mut downloads = FuturesUnordered::new();
         let mut receiving = true;
 
@@ -171,10 +214,42 @@ impl Task {
                             let date_str = local_dt.format("%Y-%m-%d").to_string();
 
                             downloads.push(async move {
+                                // Check if file is already verified in database
+                                match db::verify_file(&self_clone.db, &item.url, &self_clone.save_path).await {
+                                    Ok(true) => {
+                                        trace!("file verified, skipping: {}", item.url);
+                                        return Ok(DownloadResult::Skipped);
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        warn!("failed to verify file {}: {}", item.url, e);
+                                    }
+                                }
+
                                 match self_clone.download_media(&item, &date_str).await {
-                                    Ok(path) => {
-                                        info!("downloaded: {}", path.display());
-                                        Ok(())
+                                    Ok((path, hash, is_new)) => {
+                                        // Update database with filename and hash
+                                        let filename = path.file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("unknown");
+                                        if let Err(e) = db::upsert_media(
+                                            &self_clone.db,
+                                            &item.tweet_id,
+                                            &item.url,
+                                            Some(filename),
+                                        ).await {
+                                            warn!("failed to update media filename: {}", e);
+                                        }
+                                        if let Err(e) = db::update_hash(&self_clone.db, &item.url, &hash).await {
+                                            warn!("failed to update hash: {}", e);
+                                        }
+                                        if is_new {
+                                            info!("downloaded: {}", path.display());
+                                            Ok(DownloadResult::Downloaded)
+                                        } else {
+                                            trace!("file exists, skipped: {}", path.display());
+                                            Ok(DownloadResult::Skipped)
+                                        }
                                     }
                                     Err(e) => {
                                         warn!("failed to download {}: {}", item.url, e);
@@ -191,8 +266,10 @@ impl Task {
                 }
                 // Process completed downloads
                 result = downloads.next(), if !downloads.is_empty() => {
-                    if let Some(Ok(_)) = result {
-                        total_downloaded += 1;
+                    match result {
+                        Some(Ok(DownloadResult::Downloaded)) => total_downloaded += 1,
+                        Some(Ok(DownloadResult::Skipped)) => total_skipped += 1,
+                        _ => {}
                     }
                 }
                 // Exit when channel is closed and all downloads are complete
@@ -204,8 +281,8 @@ impl Task {
         let total_fetched = fetch_task.await.unwrap_or(0);
 
         info!(
-            "download complete for @{}: {} items downloaded out of {} fetched",
-            self.user.screen_name, total_downloaded, total_fetched
+            "complete for @{}: {} downloaded, {} skipped, {} total fetched",
+            self.user.screen_name, total_downloaded, total_skipped, total_fetched
         );
         Ok(())
     }
@@ -287,12 +364,13 @@ impl Task {
         Ok((media_items, next_cursor))
     }
 
+    /// Returns (filepath, hash, is_new_download)
     #[instrument(skip_all)]
     async fn download_media(
         &self,
         item: &MediaItem,
         date_str: &str,
-    ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(PathBuf, String, bool), Box<dyn std::error::Error + Send + Sync>> {
         let download_url = match item.media_type {
             MediaType::Image => format!("{}?name=orig", item.url),
             MediaType::Video => item.url.clone(),
@@ -313,9 +391,11 @@ impl Task {
         let filename = format!("{}-{}.{}", date_str, media_id, ext);
         let filepath = self.save_path.join(&filename);
 
+        // Check if file exists and compute hash
         if filepath.exists() {
-            info!("file already exists, skipping: {}", filepath.display());
-            return Ok(filepath);
+            let content = fs::read(&filepath).await?;
+            let hash = db::calculate_hash(&content);
+            return Ok((filepath, hash, false)); // false = not newly downloaded
         }
 
         let response = self.client.get(&download_url).send().await?;
@@ -325,11 +405,12 @@ impl Task {
         }
 
         let bytes = response.bytes().await?;
+        let hash = db::calculate_hash(&bytes);
 
         let mut file = fs::File::create(&filepath).await?;
         file.write_all(&bytes).await?;
 
-        Ok(filepath)
+        Ok((filepath, hash, true)) // true = newly downloaded
     }
 }
 
@@ -489,9 +570,23 @@ fn extract_media_from_item(item: &Value) -> Option<Vec<MediaItem>> {
 
     let result = item.pointer("/item/itemContent/tweet_results/result")?;
 
+    // Get tweet_id - try from rest_id first, then from tweet/rest_id
+    let tweet_id = result
+        .get("rest_id")
+        .or_else(|| result.pointer("/tweet/rest_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
     let legacy = result
         .get("legacy")
         .or_else(|| result.pointer("/tweet/legacy"))?;
+
+    // Extract full_text from the tweet
+    let full_text = legacy
+        .get("full_text")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     let timestamp = legacy
         .get("created_at")
@@ -517,9 +612,11 @@ fn extract_media_from_item(item: &Value) -> Option<Vec<MediaItem>> {
             "photo" => {
                 if let Some(url) = media.get("media_url_https").and_then(|v| v.as_str()) {
                     results.push(MediaItem {
+                        tweet_id: tweet_id.clone(),
                         url: url.to_string(),
                         media_type: MediaType::Image,
                         timestamp,
+                        full_text: full_text.clone(),
                     });
                 }
             }
@@ -542,9 +639,11 @@ fn extract_media_from_item(item: &Value) -> Option<Vec<MediaItem>> {
                         && let Some(url) = video.get("url").and_then(|v| v.as_str())
                     {
                         results.push(MediaItem {
+                            tweet_id: tweet_id.clone(),
                             url: url.to_string(),
                             media_type: MediaType::Video,
                             timestamp,
+                            full_text: full_text.clone(),
                         });
                     }
                 }
