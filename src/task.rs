@@ -3,8 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset, Local};
-use futures::stream::FuturesUnordered;
-use futures::stream::StreamExt;
+use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, COOKIE, REFERER, USER_AGENT};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -13,7 +12,8 @@ use serde_json::{Value, json};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
-use tracing::{error, info, instrument, trace, warn};
+use tracing::instrument;
+use tracing::{error, info, trace, warn};
 
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36";
 const DEFAULT_AUTHORIZATION: &str = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
